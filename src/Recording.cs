@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace InstaClip;
@@ -47,6 +48,7 @@ sealed class Recording
         int kbps = Math.Max(500, (int)(w * (double)h * o.Fps * Bpp.GetValueOrDefault(o.Quality ?? "good", .09) / 1000));
         var name = "InstaClip_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss", Inv);
         var temp = Unique(o.Folder, name, ".recording.mkv");
+        try { File.Delete(LogPath); } catch { }
 
         // Fastest first: frames stay on the GPU from capture to encoder. Then the GPU encoder fed from the CPU, then x264.
         var plans = new List<(string Enc, bool Gpu)>();
@@ -87,19 +89,23 @@ sealed class Recording
 
     static List<string> Args(RecordOptions o, int w, int h, int kbps, string enc, bool gpu, List<AudioFeed> feeds, string output)
     {
+        // ddagrab paces itself with Sleep(), which Windows rounds up to ~15.6 ms ticks, so at framerate=60 it skips frames
+        // unevenly. Instead it runs with no pacing (framerate well above any monitor, no duplicates): each grab waits for the
+        // screen's next real update and is stamped with when it happened. The fps filter then evens that out to the chosen rate.
         var a = new List<string>
         {
             "-hide_banner", "-y", "-nostats", "-progress", "pipe:1", "-stats_period", "0.25",
-            "-f", "lavfi", "-i", $"ddagrab=output_idx={o.Display.Index}:framerate={o.Fps}:draw_mouse=1",
+            "-f", "lavfi", "-i", $"ddagrab=output_idx={o.Display.Index}:framerate=240:dup_frames=0:draw_mouse=1",
         };
         foreach (var f in feeds)
             a.AddRange(["-thread_queue_size", "4096", "-f", f.SampleFmt, "-ar", f.SampleRate.ToString(Inv), "-ch_layout", f.Layout, "-i", f.PipePath]);
 
         // ddagrab hands over BGRA textures. scale_d3d11 resizes and converts them to NV12 on the GPU;
         // the fallback downloads them and converts on the CPU.
+        // (on the CPU path, fps goes first so only the frames that are kept get downloaded)
         var vf = gpu
-            ? $"scale_d3d11=width={w}:height={h}:format=nv12" + (enc == "h264_qsv" ? ",hwmap=derive_device=qsv,format=qsv" : "")
-            : $"hwdownload,format=bgra,scale={w}:{h}:flags=bicubic,format={(enc == null ? "yuv420p" : "nv12")}";
+            ? $"scale_d3d11=width={w}:height={h}:format=nv12" + (enc == "h264_qsv" ? ",hwmap=derive_device=qsv,format=qsv" : "") + $",fps={o.Fps}"
+            : $"fps={o.Fps},hwdownload,format=bgra,scale={w}:{h}:flags=bicubic,format={(enc == null ? "yuv420p" : "nv12")}";
         var fc = $"[0:v]{vf}[v]";
         const string Stereo = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
         if (feeds.Count == 1) fc += $";[1:a]{Stereo}[a]";
@@ -130,8 +136,10 @@ sealed class Recording
             StandardErrorEncoding = Encoding.UTF8,
         };
         foreach (var arg in args) psi.ArgumentList.Add(arg);
+        lock (err) err.AppendLine("ffmpeg " + string.Join(" ", args.Select(x => x.Contains(' ') ? $"\"{x}\"" : x)));
         proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
         var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        bool grabbing = false;
         proc.OutputDataReceived += (_, e) =>
         {
             // -progress output reports "frame=N" while encoding
@@ -147,20 +155,56 @@ sealed class Recording
             {
                 long t = Stopwatch.GetTimestamp();
                 foreach (var f in feeds) f.Begin(t);
+                grabbing = true;
             }
-            lock (err) { err.AppendLine(e.Data); if (err.Length > 16000) err.Remove(0, err.Length - 8000); }
+            lock (err) { err.AppendLine(e.Data); if (err.Length > 32000) err.Remove(0, err.Length - 16000); }
         };
         proc.Exited += (_, _) => { started.TrySetResult(false); Exited?.Invoke(); };
         proc.Start();
-        try { proc.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }   // keeps the capture smooth while a game loads the CPU
+        Prioritize(proc);
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
-        return await Task.WhenAny(started.Task, Task.Delay(15000)) == started.Task && started.Task.Result;
+        if (await Task.WhenAny(started.Task, Task.Delay(4000)) == started.Task) return started.Task.Result;
+        // Frames only flow when something on screen changes. If nothing has since the first grab, FFmpeg is up and waiting
+        if (grabbing && !proc.HasExited) return true;
+        return await Task.WhenAny(started.Task, Task.Delay(11000)) == started.Task && started.Task.Result;
     }
+
+    // Games load the CPU and GPU to the max. Without this the capture gets starved and drops frames: higher CPU priority,
+    // higher GPU scheduling priority (what OBS does too), and no Windows 11 power throttling for this windowless process.
+    static void Prioritize(Process p)
+    {
+        try { p.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
+        try { D3DKMTSetProcessSchedulingPriorityClass(p.Handle, 4); } catch { }   // D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH
+        try
+        {
+            // PROCESS_POWER_THROTTLING_EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION controlled, both turned off
+            var state = new PowerThrottlingState { Version = 1, ControlMask = 0x1 | 0x4, StateMask = 0 };
+            SetProcessInformation(p.Handle, 4, ref state, Marshal.SizeOf<PowerThrottlingState>());   // ProcessPowerThrottling
+        }
+        catch { }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PowerThrottlingState { public uint Version, ControlMask, StateMask; }
+
+    [DllImport("kernel32.dll")]
+    static extern bool SetProcessInformation(IntPtr process, int infoClass, ref PowerThrottlingState info, int size);
+
+    [DllImport("gdi32.dll")]
+    static extern int D3DKMTSetProcessSchedulingPriorityClass(IntPtr process, int priority);
 
     string ErrorTail()
     {
         lock (err) return string.Join("\n", err.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).TakeLast(3));
+    }
+
+    // %LOCALAPPDATA%\InstaClip\last-recording.log: the FFmpeg command and output of the latest recording, for troubleshooting
+    static readonly string LogPath = Path.Combine(Settings.DataDir, "last-recording.log");
+
+    void WriteLog()
+    {
+        try { lock (err) File.AppendAllText(LogPath, err + Environment.NewLine); } catch { }
     }
 
     void Abort()
@@ -168,6 +212,7 @@ sealed class Recording
         try { if (proc != null && !proc.HasExited) proc.Kill(true); } catch { }
         foreach (var f in feeds) f.Dispose();
         try { proc?.WaitForExit(3000); } catch { }
+        WriteLog();
         TryDelete(tempPath);
     }
 
@@ -189,12 +234,15 @@ sealed class Recording
     /// <summary>Waits for FFmpeg to close the .mkv, then remuxes it to .mp4. Returns the clip's path.</summary>
     public string Finish()
     {
-        if (!proc.WaitForExit(20000))
+        // A grab waits for the screen to change, so on a completely still screen FFmpeg may not get to quit.
+        // The .mkv is still readable after a kill.
+        if (!proc.WaitForExit(10000))
         {
             try { proc.Kill(true); } catch { }
             proc.WaitForExit(5000);
         }
         foreach (var f in feeds) f.Dispose();
+        WriteLog();
         if (!File.Exists(tempPath) || new FileInfo(tempPath).Length == 0)
         {
             TryDelete(tempPath);
