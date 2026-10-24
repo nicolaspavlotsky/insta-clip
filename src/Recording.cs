@@ -50,13 +50,22 @@ sealed class Recording
         var temp = Unique(o.Folder, name, ".recording.mkv");
         try { File.Delete(LogPath); } catch { }
 
-        // Fastest first: frames stay on the GPU from capture to encoder. Then the GPU encoder fed from the CPU, then x264.
-        var plans = new List<(string Enc, bool Gpu)>();
-        if (hwEncoder != null) plans.AddRange([(hwEncoder, true), (hwEncoder, false)]);
-        plans.Add((null, false));
+        // Fastest first, the way OBS / ShadowPlay do it: the captured texture never leaves the GPU.
+        //  Direct:   ddagrab's BGRA texture straight into NVENC / AMF, which convert to YUV themselves.
+        //  GpuScale: scale_d3d11 resizes / converts on the GPU. It asks for D3D11_BIND_VIDEO_ENCODER textures, which
+        //            NVIDIA's D3D11 driver rejects, so it's only tried for QSV or when resizing.
+        //  Cpu:      the texture is downloaded; the GPU encoder still does the color conversion. Last, x264.
+        bool resize = w != src.Width || h != src.Height;
+        var plans = new List<(string Enc, VideoPath Path)>();
+        if (hwEncoder is "h264_nvenc" or "h264_amf" && !resize) plans.Add((hwEncoder, VideoPath.Direct));
+        if (hwEncoder == "h264_qsv" || (hwEncoder != null && resize)) plans.Add((hwEncoder, VideoPath.GpuScale));
+        if (hwEncoder != null) plans.Add((hwEncoder, VideoPath.Cpu));
+        plans.Add((null, VideoPath.Cpu));
+        // a plan that failed once on this PC will fail again: skip it next time
+        plans.RemoveAll(p => failedPlans.Contains($"{p.Enc}/{p.Path}/{resize}") && p.Enc != null);
 
         string warning = null, error = "";
-        foreach (var (enc, gpu) in plans)
+        foreach (var (enc, path) in plans)
         {
             // WASAPI objects are made off the UI thread so their callbacks run on their own threads
             var (feeds, warn) = await Task.Run(() => OpenFeeds(o));
@@ -64,14 +73,19 @@ sealed class Recording
             var r = new Recording(ffmpeg, o.Folder, name, temp, feeds) { Warning = warning };
             try
             {
-                if (await r.Launch(Args(o, w, h, kbps, enc, gpu, feeds, temp))) return r;
+                if (await r.Launch(Args(o, w, h, kbps, enc, path, feeds, temp))) return r;
                 error = r.ErrorTail();
+                lock (failedPlans) failedPlans.Add($"{enc}/{path}/{resize}");
             }
             catch (Exception ex) { error = ex.Message; }
             await Task.Run(r.Abort);
         }
         throw new Exception("Couldn't start recording. " + error);
     }
+
+    enum VideoPath { Direct, GpuScale, Cpu }
+
+    static readonly HashSet<string> failedPlans = [];
 
     static (List<AudioFeed> Feeds, string Warning) OpenFeeds(RecordOptions o)
     {
@@ -87,7 +101,7 @@ sealed class Recording
         return (feeds, warn);
     }
 
-    static List<string> Args(RecordOptions o, int w, int h, int kbps, string enc, bool gpu, List<AudioFeed> feeds, string output)
+    static List<string> Args(RecordOptions o, int w, int h, int kbps, string enc, VideoPath path, List<AudioFeed> feeds, string output)
     {
         // ddagrab paces itself with Sleep(), which Windows rounds up to ~15.6 ms ticks, so at framerate=60 it skips frames
         // unevenly. Instead it runs with no pacing (framerate well above any monitor, no duplicates): each grab waits for the
@@ -100,12 +114,18 @@ sealed class Recording
         foreach (var f in feeds)
             a.AddRange(["-thread_queue_size", "4096", "-f", f.SampleFmt, "-ar", f.SampleRate.ToString(Inv), "-ch_layout", f.Layout, "-i", f.PipePath]);
 
-        // ddagrab hands over BGRA textures. scale_d3d11 resizes and converts them to NV12 on the GPU;
-        // the fallback downloads them and converts on the CPU.
-        // (on the CPU path, fps goes first so only the frames that are kept get downloaded)
-        var vf = gpu
-            ? $"scale_d3d11=width={w}:height={h}:format=nv12" + (enc == "h264_qsv" ? ",hwmap=derive_device=qsv,format=qsv" : "") + $",fps={o.Fps}"
-            : $"fps={o.Fps},hwdownload,format=bgra,scale={w}:{h}:flags=bicubic,format={(enc == null ? "yuv420p" : "nv12")}";
+        // ddagrab hands over BGRA textures (see Start for the paths).
+        // On the CPU path fps goes first, so only the frames that are kept get downloaded.
+        bool resize = w != o.Display.Bounds.Width || h != o.Display.Bounds.Height;
+        var vf = path switch
+        {
+            VideoPath.Direct => $"fps={o.Fps}",
+            VideoPath.GpuScale => $"scale_d3d11=width={w}:height={h}:format=nv12" + (enc == "h264_qsv" ? ",hwmap=derive_device=qsv,format=qsv" : "") + $",fps={o.Fps}",
+            _ => $"fps={o.Fps},hwdownload,format=bgra"
+                + (resize ? $",scale={w}:{h}:flags=fast_bilinear" : "")
+                // NVENC and AMF take BGRA as is and convert on the GPU; QSV and x264 need YUV
+                + (enc is "h264_nvenc" or "h264_amf" ? "" : $",format={(enc == null ? "yuv420p" : "nv12")}"),
+        };
         var fc = $"[0:v]{vf}[v]";
         const string Stereo = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
         if (feeds.Count == 1) fc += $";[1:a]{Stereo}[a]";
