@@ -160,7 +160,6 @@ sealed class AudioFeed : IDisposable
         try
         {
             await pipe.WaitForConnectionAsync(cts.Token);
-            Begin(Stopwatch.GetTimestamp());   // fallback in case FFmpeg's "first frame" line was never seen
             await foreach (var data in queue.Reader.ReadAllAsync(cts.Token))
                 await pipe.WriteAsync(data, cts.Token);
         }

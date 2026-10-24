@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.IO.Compression;
+using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -10,8 +11,9 @@ namespace InstaClip;
 record RecordOptions(Display Display, int Fps, int Height, string Quality, bool SystemAudio, bool Mic, string MicId, string Folder);
 
 /// <summary>
-/// One recording. FFmpeg grabs the monitor on the GPU (ddagrab), encodes it live at the chosen quality, mixes in the
-/// audio feeds and writes a .mkv, which stays playable if anything crashes. Stopping remuxes it to .mp4 in a few seconds.
+/// One recording. <see cref="ScreenCapture"/> produces evenly timed frames and pipes them to FFmpeg, which encodes them
+/// live at the chosen quality, mixes in the audio feeds and writes a .mkv (still playable if anything crashes).
+/// Stopping remuxes it to .mp4 in a few seconds.
 /// </summary>
 sealed class Recording
 {
@@ -20,72 +22,63 @@ sealed class Recording
     static int pipeCount;
 
     readonly string ffmpeg, folder, name, tempPath;
+    readonly ScreenCapture capture;
     readonly List<AudioFeed> feeds;
     readonly StringBuilder err = new();
+    readonly NamedPipeServerStream video;
     Process proc;
 
     public string Warning { get; private init; }
     public event Action Exited;
     public bool HasExited => proc.HasExited;
 
-    Recording(string ffmpeg, string folder, string name, string tempPath, List<AudioFeed> feeds)
+    Recording(string ffmpeg, string folder, string name, string tempPath, ScreenCapture capture, List<AudioFeed> feeds)
     {
         this.ffmpeg = ffmpeg;
         this.folder = folder;
         this.name = name;
         this.tempPath = tempPath;
+        this.capture = capture;
         this.feeds = feeds;
+        // raw frames are ~3 MB each (1080p): a big pipe buffer lets each one go across in a few large writes
+        VideoPipe = $"instaclip-{Environment.ProcessId}-{Interlocked.Increment(ref pipeCount)}-video";
+        video = new NamedPipeServerStream(VideoPipe, PipeDirection.Out, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 16 << 20);
     }
+
+    readonly string VideoPipe;
 
     /// <param name="hwEncoder">h264_nvenc / h264_amf / h264_qsv, or null for x264 on the CPU.</param>
     public static async Task<Recording> Start(string ffmpeg, string hwEncoder, RecordOptions o)
     {
-        var src = o.Display.Bounds.Size;
-        int h = o.Height > 0 && o.Height < src.Height ? o.Height : src.Height;
-        int w = h == src.Height ? src.Width : (int)Math.Round(src.Width * (double)h / src.Height / 2) * 2;
-        w -= w % 2;
-        h -= h % 2;
+        try { File.Delete(LogPath); } catch { }
+        Prioritize(Process.GetCurrentProcess());
+        ScreenCapture capture;
+        try { capture = await Task.Run(() => new ScreenCapture(o.Display, o.Height, o.Fps)); }
+        catch (Exception ex) { throw new Exception("Couldn't capture the screen. " + ex.Message); }
+
+        int w = capture.Width, h = capture.Height;
         int kbps = Math.Max(500, (int)(w * (double)h * o.Fps * Bpp.GetValueOrDefault(o.Quality ?? "good", .09) / 1000));
         var name = "InstaClip_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss", Inv);
         var temp = Unique(o.Folder, name, ".recording.mkv");
-        try { File.Delete(LogPath); } catch { }
-
-        // Fastest first, the way OBS / ShadowPlay do it: the captured texture never leaves the GPU.
-        //  Direct:   ddagrab's BGRA texture straight into NVENC / AMF, which convert to YUV themselves.
-        //  GpuScale: scale_d3d11 resizes / converts on the GPU. It asks for D3D11_BIND_VIDEO_ENCODER textures, which
-        //            NVIDIA's D3D11 driver rejects, so it's only tried for QSV or when resizing.
-        //  Cpu:      the texture is downloaded; the GPU encoder still does the color conversion. Last, x264.
-        bool resize = w != src.Width || h != src.Height;
-        var plans = new List<(string Enc, VideoPath Path)>();
-        if (hwEncoder is "h264_nvenc" or "h264_amf" && !resize) plans.Add((hwEncoder, VideoPath.Direct));
-        if (hwEncoder == "h264_qsv" || (hwEncoder != null && resize)) plans.Add((hwEncoder, VideoPath.GpuScale));
-        if (hwEncoder != null) plans.Add((hwEncoder, VideoPath.Cpu));
-        plans.Add((null, VideoPath.Cpu));
-        // a plan that failed once on this PC will fail again: skip it next time
-        plans.RemoveAll(p => failedPlans.Contains($"{p.Enc}/{p.Path}/{resize}") && p.Enc != null);
 
         string warning = null, error = "";
-        foreach (var (enc, path) in plans)
+        foreach (var enc in hwEncoder == null ? [null] : new[] { hwEncoder, null })
         {
             // WASAPI objects are made off the UI thread so their callbacks run on their own threads
             var (feeds, warn) = await Task.Run(() => OpenFeeds(o));
             warning ??= warn;
-            var r = new Recording(ffmpeg, o.Folder, name, temp, feeds) { Warning = warning };
+            var r = new Recording(ffmpeg, o.Folder, name, temp, capture, feeds) { Warning = warning };
             try
             {
-                if (await r.Launch(Args(o, w, h, kbps, enc, path, feeds, temp))) return r;
+                if (await r.Launch(Args(o, w, h, kbps, enc, r.VideoPipe, feeds, temp))) return r;
                 error = r.ErrorTail();
-                lock (failedPlans) failedPlans.Add($"{enc}/{path}/{resize}");
             }
             catch (Exception ex) { error = ex.Message; }
             await Task.Run(r.Abort);
         }
+        capture.Dispose();
         throw new Exception("Couldn't start recording. " + error);
     }
-
-    enum VideoPath { Direct, GpuScale, Cpu }
-
-    static readonly HashSet<string> failedPlans = [];
 
     static (List<AudioFeed> Feeds, string Warning) OpenFeeds(RecordOptions o)
     {
@@ -101,36 +94,22 @@ sealed class Recording
         return (feeds, warn);
     }
 
-    static List<string> Args(RecordOptions o, int w, int h, int kbps, string enc, VideoPath path, List<AudioFeed> feeds, string output)
+    static List<string> Args(RecordOptions o, int w, int h, int kbps, string enc, string videoPipe, List<AudioFeed> feeds, string output)
     {
-        // ddagrab paces itself with Sleep(), which Windows rounds up to ~15.6 ms ticks, so at framerate=60 it skips frames
-        // unevenly. Instead it runs with no pacing (framerate well above any monitor, no duplicates): each grab waits for the
-        // screen's next real update and is stamped with when it happened. The fps filter then evens that out to the chosen rate.
+        // Video arrives as raw NV12 at an exact frame rate, already scaled, audio as raw PCM: all through named pipes
         var a = new List<string>
         {
-            "-hide_banner", "-y", "-nostats", "-progress", "pipe:1", "-stats_period", "0.25",
-            "-f", "lavfi", "-i", $"ddagrab=output_idx={o.Display.Index}:framerate=240:dup_frames=0:draw_mouse=1",
+            "-hide_banner", "-y", "-nostdin", "-nostats", "-progress", "pipe:1", "-stats_period", "0.25",
+            "-thread_queue_size", "16", "-f", "rawvideo", "-pix_fmt", "nv12", "-video_size", $"{w}x{h}", "-framerate", o.Fps.ToString(Inv),
+            "-i", @"\\.\pipe\" + videoPipe,
         };
         foreach (var f in feeds)
             a.AddRange(["-thread_queue_size", "4096", "-f", f.SampleFmt, "-ar", f.SampleRate.ToString(Inv), "-ch_layout", f.Layout, "-i", f.PipePath]);
 
-        // ddagrab hands over BGRA textures (see Start for the paths).
-        // On the CPU path fps goes first, so only the frames that are kept get downloaded.
-        bool resize = w != o.Display.Bounds.Width || h != o.Display.Bounds.Height;
-        var vf = path switch
-        {
-            VideoPath.Direct => $"fps={o.Fps}",
-            VideoPath.GpuScale => $"scale_d3d11=width={w}:height={h}:format=nv12" + (enc == "h264_qsv" ? ",hwmap=derive_device=qsv,format=qsv" : "") + $",fps={o.Fps}",
-            _ => $"fps={o.Fps},hwdownload,format=bgra"
-                + (resize ? $",scale={w}:{h}:flags=fast_bilinear" : "")
-                // NVENC and AMF take BGRA as is and convert on the GPU; QSV and x264 need YUV
-                + (enc is "h264_nvenc" or "h264_amf" ? "" : $",format={(enc == null ? "yuv420p" : "nv12")}"),
-        };
-        var fc = $"[0:v]{vf}[v]";
         const string Stereo = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
-        if (feeds.Count == 1) fc += $";[1:a]{Stereo}[a]";
-        else if (feeds.Count == 2) fc += $";[1:a]{Stereo}[a1];[2:a]{Stereo}[a2];[a1][a2]amix=inputs=2:normalize=0[a]";
-        a.AddRange(["-filter_complex", fc, "-map", "[v]"]);
+        if (feeds.Count == 1) a.AddRange(["-filter_complex", $"[1:a]{Stereo}[a]"]);
+        else if (feeds.Count == 2) a.AddRange(["-filter_complex", $"[1:a]{Stereo}[a1];[2:a]{Stereo}[a2];[a1][a2]amix=inputs=2:normalize=0[a]"]);
+        a.AddRange(["-map", "0:v"]);
         if (feeds.Count > 0) a.AddRange(["-map", "[a]"]);
 
         a.AddRange(enc switch
@@ -141,25 +120,25 @@ sealed class Recording
             _ => (string[])["-c:v", "libx264", "-preset", "superfast"],
         });
         a.AddRange(["-b:v", kbps + "k", "-maxrate", kbps * 3 / 2 + "k", "-bufsize", kbps * 2 + "k", "-g", (o.Fps * 2).ToString(Inv)]);
+        // what ScreenCapture's GPU conversion produces
+        a.AddRange(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]);
         if (feeds.Count > 0) a.AddRange(["-c:a", "aac", "-b:a", "160k"]);
         a.AddRange(["-f", "matroska", output]);
         return a;
     }
 
-    /// <summary>Starts FFmpeg and waits until it's actually encoding frames. False if it gave up instead.</summary>
+    /// <summary>Starts FFmpeg, starts feeding it frames, and waits until it's encoding. False if it gave up instead.</summary>
     async Task<bool> Launch(List<string> args)
     {
         var psi = new ProcessStartInfo(ffmpeg)
         {
-            UseShellExecute = false, CreateNoWindow = true,
-            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
             StandardErrorEncoding = Encoding.UTF8,
         };
         foreach (var arg in args) psi.ArgumentList.Add(arg);
         lock (err) err.AppendLine("ffmpeg " + string.Join(" ", args.Select(x => x.Contains(' ') ? $"\"{x}\"" : x)));
         proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
         var started = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        bool grabbing = false;
         proc.OutputDataReceived += (_, e) =>
         {
             // -progress output reports "frame=N" while encoding
@@ -169,14 +148,6 @@ sealed class Recording
         proc.ErrorDataReceived += (_, e) =>
         {
             if (e.Data == null) return;
-            // FFmpeg describes the screen input right after grabbing its first frame, where the video's timeline
-            // starts: line the audio up with that moment
-            if (e.Data.StartsWith("Input #0"))
-            {
-                long t = Stopwatch.GetTimestamp();
-                foreach (var f in feeds) f.Begin(t);
-                grabbing = true;
-            }
             lock (err) { err.AppendLine(e.Data); if (err.Length > 32000) err.Remove(0, err.Length - 16000); }
         };
         proc.Exited += (_, _) => { started.TrySetResult(false); Exited?.Invoke(); };
@@ -184,14 +155,16 @@ sealed class Recording
         Prioritize(proc);
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
-        if (await Task.WhenAny(started.Task, Task.Delay(4000)) == started.Task) return started.Task.Result;
-        // Frames only flow when something on screen changes. If nothing has since the first grab, FFmpeg is up and waiting
-        if (grabbing && !proc.HasExited) return true;
-        return await Task.WhenAny(started.Task, Task.Delay(11000)) == started.Task && started.Task.Result;
+        var timeout = Task.Delay(15000);
+        var connected = video.WaitForConnectionAsync();
+        if (await Task.WhenAny(connected, started.Task, timeout) != connected || connected.IsFaulted) return false;
+        // the audio starts at the exact moment of the first video frame
+        capture.Start(video, t0 => { foreach (var f in feeds) f.Begin(t0); });
+        return await Task.WhenAny(started.Task, timeout) == started.Task && started.Task.Result;
     }
 
     // Games load the CPU and GPU to the max. Without this the capture gets starved and drops frames: higher CPU priority,
-    // higher GPU scheduling priority (what OBS does too), and no Windows 11 power throttling for this windowless process.
+    // higher GPU scheduling priority (what OBS does too), and no Windows 11 power throttling for a windowless process.
     static void Prioritize(Process p)
     {
         try { p.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }
@@ -224,45 +197,48 @@ sealed class Recording
 
     void WriteLog()
     {
-        try { lock (err) File.AppendAllText(LogPath, err + Environment.NewLine); } catch { }
+        try
+        {
+            lock (err)
+            {
+                if (capture.Error != null) err.AppendLine("capture: " + capture.Error.Message);
+                File.AppendAllText(LogPath, err + Environment.NewLine);
+            }
+        }
+        catch { }
     }
 
+    // A failed attempt: the capture is kept for the next one
     void Abort()
     {
         try { if (proc != null && !proc.HasExited) proc.Kill(true); } catch { }
+        capture.Stop();
+        try { video.Dispose(); } catch { }
         foreach (var f in feeds) f.Dispose();
         try { proc?.WaitForExit(3000); } catch { }
         WriteLog();
         TryDelete(tempPath);
     }
 
-    /// <summary>Stops grabbing: asks FFmpeg to wrap up ('q') and ends the audio streams. Returns right away.</summary>
+    /// <summary>Stops capturing and ends the video and audio streams, which makes FFmpeg finish the file.</summary>
     public void EndCapture()
     {
-        try
-        {
-            if (!proc.HasExited)
-            {
-                proc.StandardInput.Write('q');
-                proc.StandardInput.Flush();
-            }
-        }
-        catch { }
+        capture.Stop();
+        try { video.Dispose(); } catch { }
         foreach (var f in feeds) f.Stop();
     }
 
     /// <summary>Waits for FFmpeg to close the .mkv, then remuxes it to .mp4. Returns the clip's path.</summary>
     public string Finish()
     {
-        // A grab waits for the screen to change, so on a completely still screen FFmpeg may not get to quit.
-        // The .mkv is still readable after a kill.
-        if (!proc.WaitForExit(10000))
+        if (!proc.WaitForExit(15000))
         {
             try { proc.Kill(true); } catch { }
             proc.WaitForExit(5000);
         }
         foreach (var f in feeds) f.Dispose();
         WriteLog();
+        capture.Dispose();
         if (!File.Exists(tempPath) || new FileInfo(tempPath).Length == 0)
         {
             TryDelete(tempPath);

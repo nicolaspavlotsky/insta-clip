@@ -9,7 +9,7 @@ $zip = Join-Path $build 'ffmpeg.zip'
 
 if (-not (Test-Path $zip)) {
     New-Item -ItemType Directory -Force $build | Out-Null
-    # BtbN's "shared" build: a small ffmpeg.exe + the DLLs it uses. FFmpeg 8+ is needed for the scale_d3d11 filter.
+    # BtbN's "shared" build: a small ffmpeg.exe + the DLLs it uses.
     # Asset names on the rolling "latest" release change with FFmpeg versions; update this if it 404s.
     $url = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip'
     $download = Join-Path $build 'ffmpeg-download.zip'

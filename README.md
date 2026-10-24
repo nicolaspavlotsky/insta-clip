@@ -31,13 +31,20 @@ Clips are named `InstaClip_2026-10-24_21-15-03.mp4`. While recording, the video 
 
 ## How it works
 
-The screen is captured on the GPU with Windows' Desktop Duplication API (FFmpeg's `ddagrab`). It's encoded live by your GPU's hardware encoder (NVIDIA NVENC, AMD AMF or Intel Quick Sync), with x264 on the CPU as the fallback. Audio is captured with WASAPI, the same way OBS does it, and kept in sync with the video's clock. Since the encoding happens while you record, saving only takes the few seconds needed to turn the `.mkv` into an `.mp4`.
+It works the way OBS does:
+
+- **Capture:** Windows.Graphics.Capture, the same API as OBS's display capture and the Xbox Game Bar, delivers the screen as a GPU texture whenever it changes.
+- **Timing:** InstaClip's own high-resolution clock takes the newest frame exactly 60 (or 30) times a second, so the video is perfectly even.
+- **Conversion:** the GPU resizes each frame and converts it to the format the encoder wants. Only the finished frame goes to FFmpeg.
+- **Encoding:** FFmpeg encodes live with your GPU's hardware encoder (NVIDIA NVENC, AMD AMF or Intel Quick Sync), with x264 on the CPU as the fallback.
+- **Audio:** captured with WASAPI, as OBS does, and lined up with the first video frame.
+
+Since the encoding happens while you record, saving only takes the few seconds needed to turn the `.mkv` into an `.mp4`.
 
 ## Limitations
 
-- Games running in true *exclusive* fullscreen can record black or stutter, and the badge can't draw over them. Borderless or windowed fullscreen, which most modern games use, works fine.
-- If the recorded monitor changes resolution mid-recording, or a UAC prompt appears, the recording stops. Whatever was captured up to that point is saved.
-- Only monitors connected to the main GPU can be recorded. This matters on some laptops with two GPUs.
+- Games running in true *exclusive* fullscreen can record black, and the badge can't draw over them. Borderless or windowed fullscreen, which most modern games use, works fine.
+- On Windows 10, Windows draws a yellow border around the screen while it's being recorded. Windows 11 lets InstaClip turn it off.
 - If you switch audio output devices mid-recording (for example by plugging in headphones), the rest of the recording keeps listening to the old device.
 
 ## Building
@@ -52,4 +59,4 @@ The script downloads FFmpeg once into `build/`, then produces the single-file `d
 
 ## Third-party
 
-Release builds bundle [FFmpeg](https://ffmpeg.org) (GPL build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)), which is licensed under the GPL. Its license text is unpacked next to the FFmpeg binaries. Audio capture uses [NAudio](https://github.com/naudio/NAudio) (MIT).
+Release builds bundle [FFmpeg](https://ffmpeg.org) (GPL build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds)), which is licensed under the GPL. Its license text is unpacked next to the FFmpeg binaries. Audio capture uses [NAudio](https://github.com/naudio/NAudio) (MIT), and the GPU work uses [Vortice.Windows](https://github.com/amerkoleci/Vortice.Windows) (MIT).
